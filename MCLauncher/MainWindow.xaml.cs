@@ -1,11 +1,13 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using System;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
+using Microsoft.Win32;
 
 namespace MCLauncher {
     using System.Collections.Generic;
+    using System.Collections.ObjectModel;
     using System.ComponentModel;
     using System.Diagnostics;
     using System.IO;
@@ -13,7 +15,9 @@ namespace MCLauncher {
     using System.Linq;
     using System.Threading;
     using System.Windows.Data;
+    using System.Windows.Threading;
     using System.Xml.Linq;
+    using System.ServiceProcess;
     using Windows.ApplicationModel;
     using Windows.Foundation;
     using Windows.Management.Core;
@@ -22,11 +26,17 @@ namespace MCLauncher {
     using Windows.System;
     using Windows.UI.Xaml.Controls;
     using WPFDataTypes;
+    using SysVersion = System.Version;
 
     /// <summary>
     /// Interaction logic for MainWindow.xaml
     /// </summary>
-    public partial class MainWindow : Window, ICommonVersionCommands {
+    public partial class MainWindow : Window, ICommonVersionCommands, INotifyPropertyChanged {
+
+        public event PropertyChangedEventHandler PropertyChanged;
+        protected void OnPropertyChanged(string name) {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
 
         private static readonly string PREFS_PATH = @"preferences.json";
         private static readonly string IMPORTED_VERSIONS_PATH = @"imported_versions";
@@ -35,8 +45,46 @@ namespace MCLauncher {
 
         private VersionList _versions;
         public Preferences UserPrefs { get; }
+        public ObservableCollection<ServiceStatus> ServiceStatuses { get; } = new ObservableCollection<ServiceStatus>();
+        private DispatcherTimer _serviceStatusTimer;
 
         private HashSet<CollectionViewSource> _versionListViews = new HashSet<CollectionViewSource>();
+
+        private bool _isDeveloperModeEnabled;
+        public bool IsDeveloperModeEnabled {
+            get => _isDeveloperModeEnabled;
+            private set {
+                if (_isDeveloperModeEnabled != value) {
+                    _isDeveloperModeEnabled = value;
+                    OnPropertyChanged("IsDeveloperModeEnabled");
+                }
+            }
+        }
+
+        private bool _isVCRedistInstalled;
+        public bool IsVCRedistInstalled {
+            get => _isVCRedistInstalled;
+            private set {
+                if (_isVCRedistInstalled != value) {
+                    _isVCRedistInstalled = value;
+                    OnPropertyChanged("IsVCRedistInstalled");
+                }
+            }
+        }
+
+        private bool _hasDisabledServices;
+        public bool HasDisabledServices {
+            get => _hasDisabledServices;
+            private set {
+                if (_hasDisabledServices != value) {
+                    _hasDisabledServices = value;
+                    OnPropertyChanged("HasDisabledServices");
+                }
+            }
+        }
+
+        public ICommand DownloadVCRedistCommand { get; }
+        public ICommand EnableDisabledServicesCommand { get; }
 
         private readonly VersionDownloader _anonVersionDownloader = new VersionDownloader();
         private readonly VersionDownloader _userVersionDownloader = new VersionDownloader();
@@ -59,6 +107,43 @@ namespace MCLauncher {
 
             InitializeComponent();
             ShowInstalledVersionsOnlyCheckbox.DataContext = this;
+            ServiceStatusListBox.DataContext = this;
+
+            DownloadVCRedistCommand = new RelayCommand((o) => {
+                Process.Start("https://aka.ms/vs/16/release/vc_redist.x64.exe");
+            });
+
+            EnableDisabledServicesCommand = new RelayCommand((o) => {
+                foreach (var req in RequiredServices) {
+                    try {
+                        using (var sc = new ServiceController(req.ServiceName)) {
+                            if (sc.StartType == ServiceStartMode.Disabled) {
+                                var process = new Process();
+                                process.StartInfo.FileName = "sc.exe";
+                                process.StartInfo.Arguments = $"config \"{req.ServiceName}\" start= demand";
+                                process.StartInfo.Verb = "runas"; // Request elevation
+                                process.StartInfo.UseShellExecute = true;
+                                process.StartInfo.CreateNoWindow = true;
+                                process.Start();
+                                process.WaitForExit();
+                            }
+                        }
+                    } catch (Exception ex) {
+                        Debug.WriteLine("Failed to set service " + req.ServiceName + " to manual: " + ex.Message);
+                    }
+                }
+                UpdateServiceStatuses();
+            });
+
+            foreach (var req in RequiredServices) {
+                ServiceStatuses.Add(new ServiceStatus { DisplayName = req.DisplayName, ServiceName = req.ServiceName, Status = "Loading...", StartupType = "Loading..." });
+            }
+            UpdateServiceStatuses();
+
+            _serviceStatusTimer = new DispatcherTimer();
+            _serviceStatusTimer.Interval = TimeSpan.FromSeconds(5);
+            _serviceStatusTimer.Tick += (s, e) => UpdateServiceStatuses();
+            _serviceStatusTimer.Start();
 
             var versionListViewRelease = Resources["versionListViewRelease"] as CollectionViewSource;
             versionListViewRelease.Filter += new FilterEventHandler((object sender, FilterEventArgs e) => {
@@ -101,6 +186,8 @@ namespace MCLauncher {
                 _userVersionDownloader.EnableUserAuthorization();
             });
             Dispatcher.Invoke(LoadVersionList);
+
+            MessageBox.Show("It is advised to run this application as an administrator to ensure all services can be checked and managed correctly.", "Information", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         private async void LoadVersionList() {
@@ -568,6 +655,32 @@ namespace MCLauncher {
                 return;
             _hasLaunchTask = true;
             Task.Run(async () => {
+                if (!IsDeveloperModeEnabled) {
+                    MessageBox.Show(
+                        "Developer Mode is required to register Minecraft versions.\n\n" +
+                        "Please enable Developer Mode first:\n" +
+                        "Windows 11: Settings -> Privacy & security -> For developers -> Developer Mode\n" +
+                        "Windows 10: Settings -> Update & Security -> For developers -> Developer mode\n\n" +
+                        "If this PC is in S mode or managed by an organization, Developer Mode may be blocked.",
+                        "Developer Mode required",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning
+                    );
+                    _hasLaunchTask = false;
+                    v.StateChangeInfo = null;
+                    return;
+                }
+                if (!AreRequiredServicesEnabled(out var serviceMessage)) {
+                    MessageBox.Show(
+                        serviceMessage,
+                        "Required services disabled",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning
+                    );
+                    _hasLaunchTask = false;
+                    v.StateChangeInfo = null;
+                    return;
+                }
                 v.StateChangeInfo = new VersionStateChangeInfo(VersionState.MovingData);
                 if (!MoveMinecraftData(v.GamePackageFamily, v.PackageType)) {
                     Debug.WriteLine("Data restore error, aborting launch");
@@ -980,8 +1093,352 @@ namespace MCLauncher {
                 }
             }
             Debug.WriteLine("Manifest path: " + manifestPath);
+            await EnsureFrameworkDependenciesInstalled(manifestPath, gameDir, version);
             await DeploymentProgressWrapper(new PackageManager().RegisterPackageAsync(new Uri(manifestPath), null, DeploymentOptions.DevelopmentMode), version);
             Debug.WriteLine("App re-register done!");
+        }
+
+        private sealed class ServiceRequirement {
+            public string DisplayName { get; }
+            public string ServiceName { get; }
+
+            public ServiceRequirement(string displayName, string serviceName) {
+                DisplayName = displayName;
+                ServiceName = serviceName;
+            }
+        }
+
+        private static readonly ServiceRequirement[] RequiredServices = new[] {
+            new ServiceRequirement("AppX Deployment Service", "AppXSvc"),
+            new ServiceRequirement("Client License Service", "ClipSVC"),
+            new ServiceRequirement("Microsoft Store Install Service", "InstallService"),
+            new ServiceRequirement("Windows License Manager Service", "LicenseManager"),
+            new ServiceRequirement("App Readiness", "AppReadiness"),
+            new ServiceRequirement("Gaming Services", "GamingServices"),
+            new ServiceRequirement("Xbox Live Auth Manager", "XblAuthManager"),
+            new ServiceRequirement("Xbox Live Game Save", "XblGameSave"),
+            new ServiceRequirement("Xbox Live Networking Service", "XboxNetApiSvc"),
+            new ServiceRequirement("State Repository Service", "StateRepository"),
+            new ServiceRequirement("Windows Update", "wuauserv"),
+            new ServiceRequirement("Background Intelligent Transfer Service", "BITS"),
+            new ServiceRequirement("Microsoft Account Sign-in Assistant", "wlidsvc"),
+            new ServiceRequirement("Cryptographic Services", "CryptSvc"),
+            new ServiceRequirement("Windows Defender Antivirus Service", "WinDefend")
+        };
+
+        private void UpdateServiceStatuses() {
+            try {
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock")) {
+                    if (key != null) {
+                        var allowDev = key.GetValue("AllowDevelopmentWithoutDevLicense");
+                        var allowTrusted = key.GetValue("AllowAllTrustedApps");
+                        IsDeveloperModeEnabled = (allowDev is int devInt && devInt == 1) || (allowTrusted is int trustedInt && trustedInt == 1);
+                    } else {
+                        IsDeveloperModeEnabled = false;
+                    }
+                }
+            } catch (Exception) {
+                IsDeveloperModeEnabled = false;
+            }
+
+            try {
+                // Check for Visual C++ Redistributable for Visual Studio 2015-2022 x64
+                // Registry key for 2015-2022 (they use the same key, it's cumulative)
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64")) {
+                    if (key != null) {
+                        var val = key.GetValue("Installed");
+                        IsVCRedistInstalled = (val is int i && i == 1);
+                    } else {
+                        IsVCRedistInstalled = false;
+                    }
+                }
+            } catch (Exception) {
+                IsVCRedistInstalled = false;
+            }
+
+            bool foundDisabled = false;
+            foreach (var status in ServiceStatuses) {
+                try {
+                    using (var sc = new ServiceController(status.ServiceName)) {
+                        status.Status = sc.Status.ToString();
+                        status.IsRunning = sc.Status == ServiceControllerStatus.Running;
+                        status.StartupType = sc.StartType.ToString();
+                        status.IsEnabled = sc.StartType != ServiceStartMode.Disabled;
+                        if (!status.IsEnabled) {
+                            foundDisabled = true;
+                        }
+                    }
+                } catch (Exception) {
+                    status.Status = "Not Found";
+                    status.StartupType = "N/A";
+                    status.IsRunning = false;
+                    status.IsEnabled = false;
+                }
+            }
+            HasDisabledServices = foundDisabled;
+        }
+
+        private static bool AreRequiredServicesEnabled(out string message) {
+            var disabled = new List<string>();
+            var missing = new List<string>();
+            foreach (var req in RequiredServices) {
+                try {
+                    using (var sc = new ServiceController(req.ServiceName)) {
+                        var startType = sc.StartType;
+                        if (startType == ServiceStartMode.Disabled) {
+                            disabled.Add($"{req.DisplayName} ({req.ServiceName})");
+                        }
+                    }
+                } catch (InvalidOperationException) {
+                    missing.Add($"{req.DisplayName} ({req.ServiceName})");
+                } catch (Exception ex) {
+                    Debug.WriteLine("Service check failed for " + req.ServiceName + ": " + ex);
+                }
+            }
+
+            if (disabled.Count == 0 && missing.Count == 0) {
+                message = null;
+                return true;
+            }
+
+            var lines = new List<string> {
+                "The following Windows services must be enabled to launch Minecraft versions:",
+                ""
+            };
+            lines.AddRange(RequiredServices.Select(s => $"{s.DisplayName} ({s.ServiceName})"));
+            lines.Add("");
+            if (missing.Count > 0) {
+                lines.Add("Missing services:");
+                lines.AddRange(missing);
+                lines.Add("");
+            }
+            if (disabled.Count > 0) {
+                lines.Add("Disabled services:");
+                lines.AddRange(disabled);
+                lines.Add("");
+            }
+            lines.Add("Enable the services above and try again.");
+
+            message = string.Join(Environment.NewLine, lines);
+            return false;
+        }
+
+        private sealed class AppxDependency {
+            public string Name { get; }
+            public string Publisher { get; }
+            public SysVersion MinVersion { get; }
+            public ProcessorArchitecture? Architecture { get; }
+
+            public AppxDependency(string name, string publisher, SysVersion minVersion, ProcessorArchitecture? architecture) {
+                Name = name;
+                Publisher = publisher;
+                MinVersion = minVersion;
+                Architecture = architecture;
+            }
+        }
+
+        private static SysVersion ToVersion(PackageVersion version) {
+            return new SysVersion(version.Major, version.Minor, version.Build, version.Revision);
+        }
+
+        private static SysVersion ParseVersionOrNull(string value) {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            if (SysVersion.TryParse(value, out var parsed))
+                return parsed;
+            return null;
+        }
+
+        private static ProcessorArchitecture? ParseArchitectureOrNull(string value) {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+            if (Enum.TryParse(value, true, out ProcessorArchitecture arch))
+                return arch;
+            return null;
+        }
+
+        private static ProcessorArchitecture GetAppArchitectureFromManifest(XDocument doc) {
+            var identity = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "Identity");
+            var archValue = identity?.Attribute("ProcessorArchitecture")?.Value;
+            var arch = ParseArchitectureOrNull(archValue);
+            return arch ?? ProcessorArchitecture.X64;
+        }
+
+        private static List<AppxDependency> GetManifestDependencies(string manifestPath, out ProcessorArchitecture appArch) {
+            var doc = XDocument.Load(manifestPath);
+            appArch = GetAppArchitectureFromManifest(doc);
+            var dependencies = new List<AppxDependency>();
+            foreach (var dep in doc.Descendants().Where(e => e.Name.LocalName == "PackageDependency")) {
+                var name = dep.Attribute("Name")?.Value;
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+                var minVersion = ParseVersionOrNull(dep.Attribute("MinVersion")?.Value);
+                var publisher = dep.Attribute("Publisher")?.Value;
+                var arch = ParseArchitectureOrNull(dep.Attribute("ProcessorArchitecture")?.Value);
+                dependencies.Add(new AppxDependency(name, publisher, minVersion, arch));
+            }
+            return dependencies;
+        }
+
+        private static HashSet<ProcessorArchitecture> GetAllowedArchitectures(ProcessorArchitecture appArch, ProcessorArchitecture? depArch) {
+            var allowed = new HashSet<ProcessorArchitecture>();
+            if (depArch.HasValue) {
+                if (depArch.Value == ProcessorArchitecture.Neutral) {
+                    allowed.Add(ProcessorArchitecture.Neutral);
+                    if (appArch != ProcessorArchitecture.Unknown)
+                        allowed.Add(appArch);
+                } else {
+                    allowed.Add(depArch.Value);
+                }
+            } else {
+                allowed.Add(ProcessorArchitecture.Neutral);
+                if (appArch != ProcessorArchitecture.Unknown)
+                    allowed.Add(appArch);
+            }
+            return allowed;
+        }
+
+        private static bool IsDependencyInstalled(AppxDependency dep, ProcessorArchitecture appArch) {
+            var allowedArch = GetAllowedArchitectures(appArch, dep.Architecture);
+            foreach (var pkg in new PackageManager().FindPackages()) {
+                if (!string.Equals(pkg.Id.Name, dep.Name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!string.IsNullOrEmpty(dep.Publisher) && !string.Equals(pkg.Id.Publisher, dep.Publisher, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (dep.MinVersion != null) {
+                    var installedVersion = ToVersion(pkg.Id.Version);
+                    if (installedVersion < dep.MinVersion)
+                        continue;
+                }
+                if (allowedArch.Count > 0 && !allowedArch.Contains(pkg.Id.Architecture))
+                    continue;
+                return true;
+            }
+            return false;
+        }
+
+        private static IEnumerable<string> GetDependencySearchDirs(string gameDir) {
+            var dirs = new List<string>();
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            if (!string.IsNullOrEmpty(baseDir))
+                dirs.Add(Path.Combine(baseDir, "Dependencies"));
+            if (!string.IsNullOrEmpty(gameDir)) {
+                dirs.Add(Path.Combine(gameDir, "Dependencies"));
+                dirs.Add(gameDir);
+            }
+            return dirs.Distinct().Where(Directory.Exists);
+        }
+
+        private static bool IsDependencyPackageFile(string filePath, AppxDependency dep) {
+            var ext = Path.GetExtension(filePath);
+            if (string.IsNullOrEmpty(ext))
+                return false;
+            ext = ext.ToLowerInvariant();
+            if (ext != ".appx" && ext != ".msix" && ext != ".appxbundle" && ext != ".msixbundle")
+                return false;
+            var fileName = Path.GetFileNameWithoutExtension(filePath);
+            if (string.IsNullOrEmpty(fileName))
+                return false;
+            return fileName.StartsWith(dep.Name + "_", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryParsePackageFileInfo(string filePath, out SysVersion version, out ProcessorArchitecture? arch) {
+            version = null;
+            arch = null;
+            var fileName = Path.GetFileNameWithoutExtension(filePath);
+            if (string.IsNullOrEmpty(fileName))
+                return false;
+            var parts = fileName.Split('_');
+            if (parts.Length < 3)
+                return false;
+            if (!SysVersion.TryParse(parts[1], out var parsedVersion))
+                return false;
+            version = parsedVersion;
+            arch = ParseArchitectureOrNull(parts[2]);
+            return true;
+        }
+
+        private static string FindLocalDependencyPackageFile(AppxDependency dep, ProcessorArchitecture appArch, IEnumerable<string> searchDirs) {
+            string best = null;
+            SysVersion bestVersion = null;
+            var allowedArch = GetAllowedArchitectures(appArch, dep.Architecture);
+            foreach (var dir in searchDirs) {
+                foreach (var file in Directory.EnumerateFiles(dir)) {
+                    if (!IsDependencyPackageFile(file, dep))
+                        continue;
+                    if (TryParsePackageFileInfo(file, out var fileVersion, out var fileArch)) {
+                        if (dep.MinVersion != null && fileVersion < dep.MinVersion)
+                            continue;
+                        if (fileArch.HasValue && allowedArch.Count > 0 && !allowedArch.Contains(fileArch.Value))
+                            continue;
+                        if (best == null || fileVersion > bestVersion) {
+                            best = file;
+                            bestVersion = fileVersion;
+                        }
+                    } else if (best == null) {
+                        best = file;
+                    }
+                }
+            }
+            return best;
+        }
+
+        private static string BuildMissingDependencyMessage(List<AppxDependency> missing, IEnumerable<string> searchDirs) {
+            var lines = new List<string> {
+                "Missing framework package(s) required by this version:"
+            };
+            foreach (var dep in missing) {
+                string details = dep.Name;
+                if (dep.MinVersion != null)
+                    details += " (min " + dep.MinVersion + ")";
+                if (!string.IsNullOrEmpty(dep.Publisher))
+                    details += " publisher " + dep.Publisher;
+                lines.Add(details);
+            }
+            lines.Add("");
+            lines.Add("Install the missing framework(s) and try again.");
+            var dirs = searchDirs.ToList();
+            if (dirs.Count > 0) {
+                lines.Add("If you already have the .appx/.msix files, place them in one of these folders and retry:");
+                lines.AddRange(dirs);
+            }
+            return string.Join(Environment.NewLine, lines);
+        }
+
+        private async Task EnsureFrameworkDependenciesInstalled(string manifestPath, string gameDir, Version version) {
+            ProcessorArchitecture appArch;
+            List<AppxDependency> deps;
+            try {
+                deps = GetManifestDependencies(manifestPath, out appArch);
+            } catch (Exception e) {
+                Debug.WriteLine("Failed reading AppxManifest dependencies: " + e);
+                return;
+            }
+            if (deps.Count == 0)
+                return;
+
+            var missing = deps.Where(d => !IsDependencyInstalled(d, appArch)).ToList();
+            if (missing.Count == 0)
+                return;
+
+            var searchDirs = GetDependencySearchDirs(gameDir).ToList();
+            bool installedAny = false;
+            foreach (var dep in missing) {
+                var pkgFile = FindLocalDependencyPackageFile(dep, appArch, searchDirs);
+                if (pkgFile == null)
+                    continue;
+                Debug.WriteLine("Installing dependency package: " + pkgFile);
+                await DeploymentProgressWrapper(new PackageManager().AddPackageAsync(new Uri(pkgFile), null, DeploymentOptions.None), version);
+                installedAny = true;
+            }
+
+            if (installedAny) {
+                missing = deps.Where(d => !IsDependencyInstalled(d, appArch)).ToList();
+            }
+
+            if (missing.Count > 0) {
+                throw new Exception(BuildMissingDependencyMessage(missing, searchDirs));
+            }
         }
 
         private void InvokeDownload(Version v) {
@@ -1290,9 +1747,9 @@ namespace MCLauncher {
                 this.DownloadCommand = commands.DownloadCommand;
                 this.LaunchCommand = commands.LaunchCommand;
                 this.RemoveCommand = commands.RemoveCommand;
-                this.GameDirectory = (versionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-") + Name;
                 this.PackageType = packageType;
                 this.DownloadURLs = downloadUrls ?? new List<string>();
+                this.GameDirectory = ResolveGameDirectory(name, versionType, packageType);
             }
             public Version(string name, string directory, ICommonVersionCommands commands, PackageType packageType) {
                 this.UUID = UNKNOWN_UUID;
@@ -1324,6 +1781,45 @@ namespace MCLauncher {
             public PackageType PackageType { get; set; }
 
             public List<string> DownloadURLs { get; set; }
+
+            private static string GetDirectoryPrefix(VersionType versionType) {
+                return versionType == VersionType.Preview ? "Minecraft-Preview-" : "Minecraft-";
+            }
+
+            private static string BuildGameDirectory(string name, VersionType versionType, PackageType packageType) {
+                string prefix = GetDirectoryPrefix(versionType);
+                string typeTag = packageType == PackageType.GDK ? "GDK-" : "UWP-";
+                return prefix + typeTag + name;
+            }
+
+            private static string BuildLegacyGameDirectory(string name, VersionType versionType) {
+                return GetDirectoryPrefix(versionType) + name;
+            }
+
+            private static bool IsGdkDirectory(string path) {
+                try {
+                    return File.Exists(Path.Combine(path, "MicrosoftGame.Config"));
+                } catch {
+                    return false;
+                }
+            }
+
+            private static string ResolveGameDirectory(string name, VersionType versionType, PackageType packageType) {
+                string newDir = BuildGameDirectory(name, versionType, packageType);
+                if (Directory.Exists(newDir)) {
+                    return newDir;
+                }
+
+                string legacyDir = BuildLegacyGameDirectory(name, versionType);
+                if (Directory.Exists(legacyDir)) {
+                    bool legacyIsGdk = IsGdkDirectory(legacyDir);
+                    if (legacyIsGdk == (packageType == PackageType.GDK)) {
+                        return legacyDir;
+                    }
+                }
+
+                return newDir;
+            }
 
             public string GamePackageFamily
             {
@@ -1372,6 +1868,57 @@ namespace MCLauncher {
                 OnPropertyChanged("IsInstalled");
             }
 
+        }
+
+        public class BooleanToStatusConverter : IValueConverter {
+            public object Convert(object value, Type targetType, object parameter, System.Globalization.CultureInfo culture) {
+                if (value is bool b) {
+                    return b ? "Enabled" : "Disabled";
+                }
+                return "Unknown";
+            }
+
+            public object ConvertBack(object value, Type targetType, object parameter, System.Globalization.CultureInfo culture) {
+                throw new NotImplementedException();
+            }
+        }
+
+        public class ServiceStatus : NotifyPropertyChangedBase {
+            private string _displayName;
+            public string DisplayName {
+                get => _displayName;
+                set { _displayName = value; OnPropertyChanged("DisplayName"); }
+            }
+
+            private string _serviceName;
+            public string ServiceName {
+                get => _serviceName;
+                set { _serviceName = value; OnPropertyChanged("ServiceName"); }
+            }
+
+            private string _status;
+            public string Status {
+                get => _status;
+                set { _status = value; OnPropertyChanged("Status"); }
+            }
+
+            private string _startupType;
+            public string StartupType {
+                get => _startupType;
+                set { _startupType = value; OnPropertyChanged("StartupType"); }
+            }
+
+            private bool _isEnabled;
+            public bool IsEnabled {
+                get => _isEnabled;
+                set { _isEnabled = value; OnPropertyChanged("IsEnabled"); }
+            }
+
+            private bool _isRunning;
+            public bool IsRunning {
+                get => _isRunning;
+                set { _isRunning = value; OnPropertyChanged("IsRunning"); }
+            }
         }
 
         public enum VersionState {
